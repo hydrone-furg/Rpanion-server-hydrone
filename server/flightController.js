@@ -347,6 +347,8 @@ class FCDetails {
       cmd.push(this.activeDevice.serial.value + ':' + this.activeDevice.baud.value)
     } else if (this.activeDevice.inputType === 'UDP') {
       cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
+      cmd.push('-c');
+      cmd.push('~/router.conf'); #-#-#-#
     }
     console.log(cmd)
 
