@@ -94,12 +94,6 @@ class FCDetails {
 
     // mavlink-routerd path
     this.mavlinkRouterPath = null
-
-    // UART2
-    this.UART2 = {
-      port: "/dev/ttyACM1",
-      baud: 57600
-    }
     
     // load settings
     this.settings = settings
@@ -351,14 +345,8 @@ class FCDetails {
     }
     if (this.activeDevice.inputType === 'UART') {
       cmd.push(this.activeDevice.serial.value + ':' + this.activeDevice.baud.value)
-      // UART2
-      cmd.push(this.UART2.port + ':' + this.UART2.baud)
     } else if (this.activeDevice.inputType === 'UDP') {
       cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
-      // UDP2
-      const secondUdpPort = parseInt(this.activeDevice.udpInputPort, 10) + 1;
-      cmd.push('0.0.0.0:' + secondUdpPort);
-      console.log('Also opening companion UDP Link 0.0.0.0:' + secondUdpPort);
     }
     console.log(cmd)
 
