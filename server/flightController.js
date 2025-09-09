@@ -345,6 +345,8 @@ class FCDetails {
     }
     if (this.activeDevice.inputType === 'UART') {
       cmd.push(this.activeDevice.serial.value + ':' + this.activeDevice.baud.value)
+      cmd.push('-c');
+      cmd.push('~/routerUART.conf'); ##-##-##-##
     } else if (this.activeDevice.inputType === 'UDP') {
       cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
       cmd.push('-c');
