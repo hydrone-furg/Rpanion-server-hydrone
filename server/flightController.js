@@ -370,8 +370,12 @@ class FCDetails {
     if (this.activeDevice.inputType === 'UART') {
       const serialPath = getSerialPathFromValue(this.activeDevice.serial, this.serialDevices)
       cmd.push(serialPath + ':' + this.activeDevice.baud)
+      cmd.push('-c');
+      cmd.push('~/routerUART.conf'); //////
     } else if (this.activeDevice.inputType === 'UDP') {
       cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
+      cmd.push('-c');
+      cmd.push('~/router.conf'); ////
     }
     console.log(cmd)
 
