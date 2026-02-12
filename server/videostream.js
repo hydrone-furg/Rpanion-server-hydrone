@@ -1,8 +1,9 @@
-const { exec, spawn } = require('child_process')
+const { exec, execSync, spawn } = require('child_process')
 const os = require('os')
 const si = require('systeminformation')
 const events = require('events')
 const { minimal, common } = require('node-mavlink')
+const logpaths = require('./paths.js')
 
 class videoStream {
   constructor (settings) {
@@ -27,27 +28,63 @@ class videoStream {
     // need to scan for video devices first though
     if (this.active) {
       this.active = false
+      this.initializeVideo()
+    }
+  }
+
+  async initializeVideo() {
+    // Initialize video streaming on startup using promises to avoid race conditions
+    try {
+      await this.getVideoDevicesPromise()
+      await this.startStopStreamingPromise(
+        true,
+        this.savedDevice.device,
+        this.savedDevice.height,
+        this.savedDevice.width,
+        this.savedDevice.format,
+        this.savedDevice.rotation,
+        this.savedDevice.bitrate,
+        this.savedDevice.fps,
+        this.savedDevice.transport,
+        this.savedDevice.useUDPIP,
+        this.savedDevice.useUDPPort,
+        this.savedDevice.useTimestamp,
+        this.savedDevice.useCameraHeartbeat,
+        this.savedDevice.mavStreamSelected,
+        this.savedDevice.compression,
+        this.savedDevice.customRTSPSource
+      )
+    } catch (error) {
+      // failed setup, reset settings
+      console.log('Reset video - initialization failed:', error)
+      this.resetVideo()
+    }
+  }
+
+  getVideoDevicesPromise() {
+    // Promise wrapper for getVideoDevices
+    return new Promise((resolve, reject) => {
       this.getVideoDevices((error) => {
-        if (!error) {
-          this.startStopStreaming(true, this.savedDevice.device, this.savedDevice.height,
-            this.savedDevice.width, this.savedDevice.format,
-            this.savedDevice.rotation, this.savedDevice.bitrate, this.savedDevice.fps, this.savedDevice.useUDP,
-            this.savedDevice.useUDPIP, this.savedDevice.useUDPPort, this.savedDevice.useTimestamp, this.savedDevice.useCameraHeartbeat,
-            this.savedDevice.mavStreamSelected, this.savedDevice.compression, (err) => {
-              if (err) {
-                // failed setup, reset settings
-                console.log('Reset video4')
-                this.resetVideo()
-              }
-            })
+        if (error) {
+          reject(error)
         } else {
-          // failed setup, reset settings
-          console.log('Reset video3')
-          this.resetVideo()
-          console.log(error)
+          resolve()
         }
       })
-    }
+    })
+  }
+
+  startStopStreamingPromise(active, device, height, width, format, rotation, bitrate, fps, transport, useUDPIP, useUDPPort, useTimestamp, useCameraHeartbeat, mavStreamSelected, compression, customRTSPSource) {
+    // Promise wrapper for startStopStreaming
+    return new Promise((resolve, reject) => {
+      this.startStopStreaming(active, device, height, width, format, rotation, bitrate, fps, transport, useUDPIP, useUDPPort, useTimestamp, useCameraHeartbeat, mavStreamSelected, compression, customRTSPSource, (err, active, addresses) => {
+        if (err) {
+          reject(err)
+        } else {
+          resolve({ active, addresses })
+        }
+      })
+    })
   }
 
   // Format and store all the possible rtsp addresses
@@ -56,15 +93,82 @@ class videoStream {
     this.ifaces = this.scanInterfaces()
     this.deviceAddresses = []
     for (let j = 0; j < this.ifaces.length; j++) {
-      this.deviceAddresses.push('rtsp://' + this.ifaces[j] + ':8554/' + factory)
+      if (factory.includes('rtsp://')) {
+        // remove any rtsp username or passwords, format rtsp://admin:admin@192.168.1.217:554/11
+        let rtspfactory = factory
+        rtspfactory = factory.replace('rtsp://', '')
+        if (rtspfactory.includes('@')) {
+          rtspfactory = rtspfactory.split('@')[1]
+        }
+        this.deviceAddresses.push('rtsp://' + this.ifaces[j] + ':8554/' + rtspfactory.replace(/\W/g, ''))
+      } else {
+        // note that video device URL's are the alphanumeric characters only. So /dev/video0 -> devvideo0
+        this.deviceAddresses.push('rtsp://' + this.ifaces[j] + ':8554/' + factory.replace(/\W/g, ''))
+      }
     }
+  }
+
+  getCompressionSelect(val) {
+    // return the compression select object for a given value
+    const options = [
+      { value: 'H264', label: 'H.264' },
+      { value: 'H265', label: 'H.265' },
+    ]
+    const sel = options.filter(it => it.value === val)
+    if (sel.length === 1) {
+      return sel[0]
+    } else {
+      return options[0]
+    }
+  }
+
+  getTransportSelect(val) {
+    // return the transport select object for a given value
+    const options = [
+      { value: 'RTP', label: 'RTP' },
+      { value: 'RTSP', label: 'RTSP' },
+    ]
+    const sel = options.filter(it => it.value === val)
+    if (sel.length === 1) {
+      return sel[0]
+    } else {
+      return options[1]
+    }
+  }
+
+  getTransportOptions(){
+    // get transport options
+    return [
+      { value: 'RTP', label: 'RTP' },
+      { value: 'RTSP', label: 'RTSP' },
+    ];
   }
 
   // video streaming
   getVideoDevices (callback) {
     // get all video device details
-    // callback is: err, devices, active, seldevice, selRes, selRot, selbitrate, selfps, SeluseUDP, SeluseUDPIP, SeluseUDPPort, timestamp, fps, FPSMax, vidres, cameraHeartbeat, selMavURI
-    exec('python3 ./python/gstcaps.py', (error, stdout, stderr) => {
+    //dont update if streaming is running, as some camera won't be detected if in use
+    if (this.deviceStream !== null) {
+      return callback(null, this.devices, this.active, this.savedDevice.device, this.savedDevice.width.toString() + 'x' + this.savedDevice.height.toString() + 'x' + this.savedDevice.format.toString().split('/')[1],
+        this.savedDevice.rotation,
+        this.savedDevice.bitrate,
+        this.savedDevice.fps,
+        this.savedDevice.useUDPIP,
+        this.savedDevice.useUDPPort,
+        this.savedDevice.useTimestamp,
+        (this.devices.filter(it => it.value === this.savedDevice.device)[0].caps.filter(it => it.value === this.savedDevice.width.toString() + 'x' + this.savedDevice.height.toString() + 'x' + this.savedDevice.format.toString().split('/')[1])[0].fps !== undefined) ? this.devices.filter(it => it.value === this.savedDevice.device)[0].caps.filter(it => it.value === this.savedDevice.width.toString() + 'x' + this.savedDevice.height.toString() + 'x' + this.savedDevice.format.toString().split('/')[1])[0].fps : [],
+        this.devices.filter(it => it.value === this.savedDevice.device)[0].caps.filter(it => it.value === this.savedDevice.width.toString() + 'x' + this.savedDevice.height.toString() + 'x' + this.savedDevice.format.toString().split('/')[1])[0].fpsmax,
+        this.devices.filter(it => it.value === this.savedDevice.device)[0].caps,
+        this.savedDevice.useCameraHeartbeat,
+        { label: this.savedDevice.mavStreamSelected.toString(), value: this.savedDevice.mavStreamSelected },
+        this.savedDevice.compression,
+        this.savedDevice.transport,
+        this.getTransportOptions(),
+        this.savedDevice.customRTSPSource)
+    }
+    // callback is: err, devices, active, seldevice, selRes, selRot, selbitrate, selfps, SeluseUDPIP, SeluseUDPPort, timestamp, fps, FPSMax, vidres, cameraHeartbeat, selMavURI, compression, transport, transportOptions, customRTSPSource
+    const pythonPath = logpaths.getPythonPath()
+    exec(`${pythonPath} ./python/gstcaps.py`, (error, stdout, stderr) => {
       const warnstrings = ['DeprecationWarning', 'gst_element_message_full_with_details', 'camera_manager.cpp', 'Unsupported V4L2 pixel format']
       if (stderr && !warnstrings.some(wrn => stderr.includes(wrn))) {
         console.error(`exec error: ${error}`)
@@ -72,25 +176,49 @@ class videoStream {
       } else {
         console.log(stdout)
         this.devices = JSON.parse(stdout)
+        // add rtsp source
+        this.devices.push({ label: 'RTSP Source (H.264)', value: 'rtspsourceh264', caps: [
+          {
+            label: 'Custom RTSP Source', value: '1x1xx-h264', width: 1, height: 1, format: 'video/x-h264',
+            fps: [{ label: 'N/A', value: 1 }], fpsmax: 0
+          }
+        ]
+        })
+        this.devices.push({ label: 'RTSP Source (H.265)', value: 'rtspsourceh265', caps: [
+          {
+            label: 'Custom RTSP Source', value: '1x1xx-h265', width: 1, height: 1, format: 'video/x-h265',
+            fps: [{ label: 'N/A', value: 1 }], fpsmax: 0
+          }
+        ]
+        })
         //console.log(this.devices)
         const fpsSelected = ((this.devices.length > 0) ? (this.devices[0].caps[0].fpsmax === 0 ? this.devices[0].caps[0].fps[0] : this.devices[0].caps[0].fpsmax) : 1)
         // and return current settings
         if (!this.active) {
-          return callback(null, this.devices, this.active, this.devices[0], this.devices[0].caps[0],
-            { label: '0°', value: 0 }, 1100, fpsSelected, false, '127.0.0.1', 5400, false,
+          return callback(null, this.devices, this.active, this.devices[0].value, this.devices[0].caps[0].value,
+            0, 1100, fpsSelected, '127.0.0.1', 5400, false,
             (this.devices[0].caps[0].fps !== undefined) ? this.devices[0].caps[0].fps : [],
-            this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, { label: '127.0.0.1', value: 0 })
+            this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, '127.0.0.1',
+            'H264', 'RTSP', this.getTransportOptions(), "")
         } else {
           // format saved settings
           const seldevice = this.devices.filter(it => it.value === this.savedDevice.device)
           if (seldevice.length !== 1) {
             // bad settings
             console.error('Bad video settings1 Resetting')
+            // if video is active but bad settings, reset
+            if (this.active) {
+              //stop streaming
+              this.startStopStreaming(false, '', 0, 0, '', 0, 0, 0, '', '', 0, false, false, '', '', '', () => {
+                console.log('Stopped streaming due to bad settings')
+              })
+            }
             this.resetVideo()
-            return callback(null, this.devices, this.active, this.devices[0], this.devices[0].caps[0],
-              { label: '0°', value: 0 }, 1100, fpsSelected, false, '127.0.0.1', 5400, false,
+            return callback(null, this.devices, this.active, this.devices[0].value, this.devices[0].caps[0].value,
+              0, 1100, fpsSelected, '127.0.0.1', 5400, false,
               (this.devices[0].caps[0].fps !== undefined) ? this.devices[0].caps[0].fps : [],
-              this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, { label: '127.0.0.1', value: 0 })
+              this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, '127.0.0.1',
+              'H264', 'RTSP', this.getTransportOptions(), "")
           }
           const selRes = seldevice[0].caps.filter(it => it.value === this.savedDevice.width.toString() + 'x' + this.savedDevice.height.toString() + 'x' + this.savedDevice.format.toString().split('/')[1])
           let selFPS = this.savedDevice.fps
@@ -98,21 +226,30 @@ class videoStream {
             selFPS = selRes[0].fps.filter(it => parseInt(it.value) === this.savedDevice.fps)[0]
           }
           if (seldevice.length === 1 && selRes.length === 1) {
-            this.populateAddresses(seldevice[0].value.replace(/\W/g, ''))
+            if (seldevice[0].value === 'rtspsourceh264' || seldevice[0].value === 'rtspsourceh265') {
+              // for rtsp source, override format to match
+              console.log('Populate RTSP Source addresses: ' + this.savedDevice.customRTSPSource)
+              this.populateAddresses(this.savedDevice.customRTSPSource)
+            } else {
+              this.populateAddresses(seldevice[0].value.toString())
+            }
             //console.log(seldevice[0])
-            return callback(null, this.devices, this.active, seldevice[0], selRes[0],
-              { label: this.savedDevice.rotation.toString() + '°', value: this.savedDevice.rotation },
-              this.savedDevice.bitrate, selFPS, this.savedDevice.useUDP, this.savedDevice.useUDPIP,
+            return callback(null, this.devices, this.active, seldevice[0].value, selRes[0].value,
+              this.savedDevice.rotation,
+              this.savedDevice.bitrate, selFPS, this.savedDevice.useUDPIP,
               this.savedDevice.useUDPPort, this.savedDevice.useTimestamp, (selRes[0].fps !== undefined) ? selRes[0].fps : [],
-              selRes[0].fpsmax, seldevice[0].caps, this.savedDevice.useCameraHeartbeat, { label: this.savedDevice.mavStreamSelected.toString(), value: this.savedDevice.mavStreamSelected })
+              selRes[0].fpsmax, seldevice[0].caps, this.savedDevice.useCameraHeartbeat,
+              { label: this.savedDevice.mavStreamSelected.toString(), value: this.savedDevice.mavStreamSelected },
+              this.savedDevice.compression, this.savedDevice.transport, this.getTransportOptions(), this.savedDevice.customRTSPSource)
           } else {
             // bad settings
-            console.error('Bad video settings. Resetting' + seldevice + ', ' + selRes)
+            console.error('Bad video settings. Resetting ' + JSON.stringify(seldevice) + ', ' + selRes.toString())
             this.resetVideo()
-            return callback(null, this.devices, this.active, this.devices[0], this.devices[0].caps[0],
-              { label: '0°', value: 0 }, 1100, fpsSelected, false, '127.0.0.1', 5400, false,
+            return callback(null, this.devices, this.active, this.devices[0].value, this.devices[0].caps[0].value,
+              0, 1100, fpsSelected, '127.0.0.1', 5400, false,
               (this.devices[0].caps[0].fps !== undefined) ? this.devices[0].caps[0].fps : [],
-              this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, { label: '127.0.0.1', value: 0 })
+              this.devices[0].caps[0].fpsmax, this.devices[0].caps, false, '127.0.0.1',
+              'H264', 'RTSP', this.getTransportOptions(), "")
           }
         }
       }
@@ -155,7 +292,7 @@ class videoStream {
     return iface
   }
 
-  async startStopStreaming (active, device, height, width, format, rotation, bitrate, fps, useUDP, useUDPIP, useUDPPort, useTimestamp, useCameraHeartbeat, mavStreamSelected, compression, callback) {
+  async startStopStreaming (active, device, height, width, format, rotation, bitrate, fps, transport, useUDPIP, useUDPPort, useTimestamp, useCameraHeartbeat, mavStreamSelected, compression, customRTSPSource, callback) {
     // if current state same, don't do anything
     if (this.active === active) {
       console.log('Video current same')
@@ -188,17 +325,23 @@ class videoStream {
         bitrate,
         fps,
         rotation,
-        useUDP,
+        transport,
         useUDPIP,
         useUDPPort,
         useTimestamp,
         useCameraHeartbeat,
         mavStreamSelected,
-        compression
+        compression,
+        customRTSPSource
+      }
+
+      //format rtsp source differently
+      if (device === 'rtspsourceh264' || device === 'rtspsourceh265') {
+        device = customRTSPSource
       }
 
       // note that video device URL's are the alphanumeric characters only. So /dev/video0 -> devvideo0
-      this.populateAddresses(device.replace(/\W/g, ''))
+      this.populateAddresses(device.toString())
 
       // rpi camera has different name under Ubuntu
       if (await this.isUbuntu() && device === 'rpicam') {
@@ -206,7 +349,7 @@ class videoStream {
         format = 'video/x-raw'
       }
 
-      const args = ['./python/rtsp-server.py',
+      const args = ['./python/video-server.py',
         '--video=' + device,
         '--height=' + height,
         '--width=' + width,
@@ -214,7 +357,8 @@ class videoStream {
         '--bitrate=' + bitrate,
         '--rotation=' + rotation,
         '--fps=' + fps,
-        '--udp=' + ((useUDP === false) ? '0' : useUDPIP + ':' + useUDPPort.toString()),
+        '--transport=' + transport,
+        '--udp=' + useUDPIP + ':' + useUDPPort.toString(),
         '--compression=' + compression
       ]
 
@@ -222,12 +366,15 @@ class videoStream {
         args.push('--timestamp')
       }
 
-      this.deviceStream = spawn('python3', args)
+      console.log('Starting video with args: ' + args.toString())
+
+      const pythonPath = logpaths.getPythonPath()
+      this.deviceStream = spawn(pythonPath, args)
 
       try {
         if (this.deviceStream === null) {
           this.settings.setValue('videostream.active', false)
-          console.log('Error spawning rtsp-server.py')
+          console.log('Error spawning video-server.py')
           return callback(null, this.active, this.deviceAddresses)
         }
         this.settings.setValue('videostream.active', this.active)
@@ -241,7 +388,9 @@ class videoStream {
       })
 
       this.deviceStream.stderr.on('data', (data) => {
-        console.error(`GST stderr: ${data}`)
+        if (!data.toString().includes('FIXME')) {
+          console.error(`GST stderr: ${data}`)
+        }
       })
 
       this.deviceStream.on('close', (code) => {
@@ -261,6 +410,11 @@ class videoStream {
     } else {
       // stop streaming
       // if mavlink advertising is on, clear the interval
+
+      // Remove all listeners before killing
+      this.deviceStream.stdout.removeAllListeners()
+      this.deviceStream.stderr.removeAllListeners()
+      this.deviceStream.removeAllListeners()
 
       if (this.savedDevice.useCameraHeartbeat) {
         clearInterval(this.intervalObj)
@@ -285,6 +439,15 @@ class videoStream {
     return ret
   }
 
+  getStreamingStatus () {
+    // return the current streaming status
+    if (this.active) {
+      return 'Active - Streaming video'
+    } else {
+      return 'Not streaming'
+    }
+  }
+
   startInterval () {
     // start the 1-sec loop to send heartbeat events
     this.intervalObj = setInterval(() => {
@@ -302,9 +465,9 @@ class videoStream {
       return
     }
 
-    if (data.targetComponent === minimal.MavComponent.CAMERA &&
-      packet.header.msgid === common.CommandLong.MSG_ID &&
-      data._param1 === common.CameraInformation.MSG_ID) {
+    if (packet.header.msgid === common.CommandLong.MSG_ID &&
+      data._param1 === common.CameraInformation.MSG_ID && 
+      data.targetComponent === minimal.MavComponent.CAMERA) {
       console.log('Responding to MAVLink request for CameraInformation')
 
       const senderSysId = packet.header.sysid
@@ -332,8 +495,8 @@ class videoStream {
       msg.gimbalDeviceId = 0
       this.eventEmitter.emit('camerainfo', msg, senderSysId, senderCompId, targetComponent)
 
-    } else if (data.targetComponent === minimal.MavComponent.CAMERA &&
-      packet.header.msgid === common.CommandLong.MSG_ID &&
+    } else if (packet.header.msgid === common.CommandLong.MSG_ID &&
+      data.targetComponent === minimal.MavComponent.CAMERA &&
       data._param1 === common.VideoStreamInformation.MSG_ID) {
 
       console.log('Responding to MAVLink request for VideoStreamInformation')
@@ -350,7 +513,7 @@ class videoStream {
       msg.count = 1
 
       // msg.type and msg.uri need to be different depending on whether RTP or RTSP is selected
-      if (this.savedDevice.useUDP) {
+      if (this.savedDevice.transport == 'RTP') {
         // msg.type = 0 = VIDEO_STREAM_TYPE_RTSP
         // msg.type = 1 = VIDEO_STREAM_TYPE_RTPUDP
         msg.type = 1

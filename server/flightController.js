@@ -1,32 +1,11 @@
-const { autoDetect } = require('@serialport/bindings-cpp')
 const fs = require('fs')
 const events = require('events')
 const path = require('path')
 const { spawn, spawnSync } = require('child_process')
-const si = require('systeminformation')
 
 const mavManager = require('../mavlink/mavManager.js')
 const logpaths = require('./paths.js')
-
-function isPi () {
-  let cpuInfo = ''
-  try {
-    cpuInfo = fs.readFileSync('/proc/device-tree/compatible', { encoding: 'utf8' })
-  } catch (e) {
-    // if this fails, this is probably not a pi
-    return false
-  }
-
-  const model = cpuInfo
-    .split(',')
-    .filter(line => line.length > 0)
-
-  if (!model || model.length === 0) {
-    return false
-  }
-
-  return model[0] === 'raspberrypi'
-}
+const { detectSerialDevices, isModemManagerInstalled, isPi, getSerialPathFromValue } = require('./serialDetection.js')
 
 class FCDetails {
   constructor (settings) {
@@ -87,14 +66,17 @@ class FCDetails {
     // Current binlog via mavlink-router
     this.binlog = null
 
-    this.tlogging = false
+    this.doLogging = false
+
+    // DataFlash logger process
+    this.dflogger = null
 
     // Is the connection active?
     this.active = false
 
     // mavlink-routerd path
     this.mavlinkRouterPath = null
-    
+
     // load settings
     this.settings = settings
     this.activeDevice = this.settings.value('flightcontroller.activeDevice', null)
@@ -104,7 +86,7 @@ class FCDetails {
     this.enableUDPB = this.settings.value('flightcontroller.enableUDPB', true)
     this.UDPBPort = this.settings.value('flightcontroller.UDPBPort', 14550)
     this.enableDSRequest = this.settings.value('flightcontroller.enableDSRequest', false)
-    this.tlogging = this.settings.value('flightcontroller.tlogging', false)
+    this.doLogging = this.settings.value('flightcontroller.doLogging', false)
     this.active = this.settings.value('flightcontroller.active', false)
 
     if (this.active) {
@@ -113,11 +95,11 @@ class FCDetails {
         if (this.activeDevice.inputType === 'UART') {
           let found = false
           for (let i = 0, len = devices.length; i < len; i++) {
-            if (this.activeDevice.serial.value === devices[i].value) {
+            if (this.activeDevice.serial === devices[i].value) {
               found = true
               this.startLink((err) => {
                 if (err) {
-                  console.log("Can't open found FC " + this.activeDevice.serial.value + ', resetting link')
+                  console.log("Can't open found FC " + this.activeDevice.serial + ', resetting link')
                   this.activeDevice = null
                   this.active = false
                 }
@@ -167,16 +149,7 @@ class FCDetails {
     }
   }
 
-  isModemManagerInstalled () {
-    // check ModemManager is installed
-    const ls = spawnSync('which', ['ModemManager'])
-    console.log(ls.stdout.toString())
-    if (ls.stdout.toString().includes('ModemManager')) {
-      return true
-    } else {
-      return false
-    }
-  }
+
 
   getUDPOutputs () {
     // get list of current UDP outputs
@@ -315,17 +288,68 @@ class FCDetails {
     }
   }
 
+  startDFLogger () {
+    // Start the dataflash logger Python process
+    if (this.dflogger !== null) {
+      console.log('DFLogger already running')
+      return
+    }
+
+    console.log('Starting DataFlash logger')
+    const pythonPath = logpaths.getPythonPath()
+    const dfloggerPath = path.join(__dirname, '..', 'python', 'dflogger.py')
+    
+    this.dflogger = spawn(pythonPath, [
+      dfloggerPath,
+      '--connection', 'udp:127.0.0.1:14541',
+      '--logdir', logpaths.flightsLogsDir,
+      '--rotate-on-disarm'
+    ])
+
+    this.dflogger.stdout.on('data', (data) => {
+      console.log(`DFLogger: ${data}`)
+    })
+
+    this.dflogger.stderr.on('data', (data) => {
+      console.error(`DFLogger stderr: ${data}`)
+    })
+
+    this.dflogger.on('close', (code) => {
+      console.log(`DFLogger exited with code ${code}`)
+      this.dflogger = null
+    })
+  }
+
+  stopDFLogger () {
+    // Stop the dataflash logger Python process
+    if (this.dflogger === null) {
+      console.log('DFLogger not running')
+      return
+    }
+
+    console.log('Stopping DataFlash logger')
+    this.dflogger.kill('SIGTERM')
+    this.dflogger = null
+  }
+
+  getDFLoggerStatus () {
+    // Get the current status of the dataflash logger
+    return {
+      running: this.dflogger !== null
+    }
+  }
+
   startLink (callback) {
     // start the serial link
     if (this.activeDevice.inputType === 'UDP') {
-      console.log('Opening UDP Link ' + '0.0.0.0:' + this.activeDevice.udpInputPort + ', MAV v' + this.activeDevice.mavversion.value)
+      console.log('Opening UDP Link ' + '0.0.0.0:' + this.activeDevice.udpInputPort + ', MAV v' + this.activeDevice.mavversion)
     } else {
-      console.log('Opening UART Link ' + this.activeDevice.serial.value + ' @ ' + this.activeDevice.baud.value + ', MAV v' + this.activeDevice.mavversion.value)
+      console.log('Opening UART Link ' + this.activeDevice.serial + ' @ ' + this.activeDevice.baud + ', MAV v' + this.activeDevice.mavversion)
     }
     // this.outputs.push({ IP: newIP, port: newPort })
 
     // build up the commandline for mavlink-router
-    const cmd = ['-e', '127.0.0.1:14540', '--tcp-port']
+    const cmd = ['-e', '127.0.0.1:14540', '-e', '127.0.0.1:14541', '--tcp-port']
     if (this.enableTCP === true) {
       cmd.push('5760')
     } else {
@@ -335,22 +359,19 @@ class FCDetails {
       cmd.push('-e')
       cmd.push(this.UDPoutputs[i].IP + ':' + this.UDPoutputs[i].port)
     }
-    cmd.push('--log')
-    cmd.push(logpaths.flightsLogsDir)
-    if (this.tlogging === true) {
-      cmd.push('--telemetry-log')
-    }
+    //cmd.push('--log')
+    //cmd.push(logpaths.flightsLogsDir)
+    //if (this.doLogging === true) {
+    //  cmd.push('--telemetry-log')
+    //}
     if (this.enableUDPB === true) {
       cmd.push('0.0.0.0:' + this.UDPBPort)
     }
     if (this.activeDevice.inputType === 'UART') {
-      cmd.push(this.activeDevice.serial.value + ':' + this.activeDevice.baud.value)
-      cmd.push('-c');
-      cmd.push('~/routerUART.conf'); //////
+      const serialPath = getSerialPathFromValue(this.activeDevice.serial, this.serialDevices)
+      cmd.push(serialPath + ':' + this.activeDevice.baud)
     } else if (this.activeDevice.inputType === 'UDP') {
       cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
-      cmd.push('-c');
-      cmd.push('~/router.conf'); ////
     }
     console.log(cmd)
 
@@ -399,7 +420,7 @@ class FCDetails {
     // only restart the mavlink processor if it's a new link,
     // not a reconnect attempt
     if (this.m === null) {
-      this.m = new mavManager(this.activeDevice.mavversion.value, '127.0.0.1', 14540, this.enableDSRequest)
+      this.m = new mavManager(this.activeDevice.mavversion, '127.0.0.1', 14540, this.enableDSRequest)
       this.m.eventEmitter.on('gotMessage', (packet, data) => {
         // got valid message - send on to attached classes
         this.previousConnection = true
@@ -416,6 +437,11 @@ class FCDetails {
     })
     this.eventEmitter.emit('newLink')
 
+    // Start dataflash logger if logging enabled
+    if (this.doLogging === true) {
+      this.startDFLogger()
+    }
+
     this.active = true
     return callback(null, true)
   }
@@ -423,6 +449,12 @@ class FCDetails {
   closeLink (callback) {
     // stop the serial link
     this.active = false
+    
+    // Stop dataflash logger if running
+    if (this.dflogger !== null) {
+      this.stopDFLogger()
+    }
+    
     if (this.router && this.router.exitCode === null) {
       this.router.kill('SIGINT')
       console.log('Trying to close router')
@@ -434,95 +466,50 @@ class FCDetails {
     }
   }
 
+  checkSerialPortIssues () {
+    // Check if ModemManager is installed
+    if (isModemManagerInstalled()) {
+      return new Error('The ModemManager package is installed. This must be uninstalled (via sudo apt remove modemmanager), due to conflicts with serial ports')
+    }
+
+    // Check if serial console is active on Raspberry Pi
+    if (fs.existsSync('/boot/cmdline.txt') && isPi()) {
+      const data = fs.readFileSync('/boot/cmdline.txt', { encoding: 'utf8', flag: 'r' })
+      if (data.includes('console=serial0')) {
+        return new Error('Serial console is active on /dev/serial0. Use raspi-config to deactivate it')
+      }
+    }
+
+    return null
+  }
+
   async getDeviceSettings (callback) {
     // get all serial devices
     this.serialDevices = []
     let retError = null
 
-    const Binding = autoDetect()
-    const ports = await Binding.list()
+    // Detect all serial devices using hardwareDetection module
+    this.serialDevices = await detectSerialDevices()
 
-    for (let i = 0, len = ports.length; i < len; i++) {
-      if (ports[i].pnpId !== undefined) {
-        // usb-ArduPilot_Pixhawk1-1M_32002A000847323433353231-if00
-        // console.log("Port: ", ports[i].pnpID);
-        let namePorts = ''
-        if (ports[i].pnpId.split('_').length > 2) {
-          namePorts = ports[i].pnpId.split('_')[1] + ' (' + ports[i].path + ')'
-        } else {
-          namePorts = ports[i].manufacturer + ' (' + ports[i].path + ')'
-        }
-        // console.log("Port: ", ports[i].pnpID);
-        this.serialDevices.push({ value: ports[i].path, label: namePorts, pnpId: ports[i].pnpId })
-      } else if (ports[i].manufacturer !== undefined) {
-        // on recent RasPiOS, the pnpID is undefined :(
-        const nameports = ports[i].manufacturer + ' (' + ports[i].path + ')'
-        this.serialDevices.push({ value: ports[i].path, label: nameports, pnpId: nameports })
-      }
-    }
-    // if the serial console or modemmanager are active on the Pi, return error
-    if (this.isModemManagerInstalled()) {
-      retError = Error('The ModemManager package is installed. This must be uninstalled (via sudo apt remove modemmanager), due to conflicts with serial ports')
-    }
-    if (fs.existsSync('/boot/cmdline.txt') && isPi()) {
-      const data = fs.readFileSync('/boot/cmdline.txt', { encoding: 'utf8', flag: 'r' })
-      if (data.includes('console=serial0')) {
-        retError = Error('Serial console is active on /dev/serial0. Use raspi-config to deactivate it')
-      }
-    }
-    // for the Ras Pi's inbuilt UART
-    if (fs.existsSync('/dev/serial0') && isPi()) {
-      this.serialDevices.push({ value: '/dev/serial0', label: '/dev/serial0', pnpId: '/dev/serial0' })
-    }
-    if (fs.existsSync('/dev/ttyAMA0') && isPi()) {
-      //Pi5 uses a different UART name. See https://forums.raspberrypi.com/viewtopic.php?t=359132
-      this.serialDevices.push({ value: '/dev/ttyAMA0', label: '/dev/ttyAMA0', pnpId: '/dev/ttyAMA0' })
-    }
-    if (fs.existsSync('/dev/ttyAMA1') && isPi()) {
-      this.serialDevices.push({ value: '/dev/ttyAMA1', label: '/dev/ttyAMA1', pnpId: '/dev/ttyAMA1' })
-    }
-    if (fs.existsSync('/dev/ttyAMA2') && isPi()) {
-      this.serialDevices.push({ value: '/dev/ttyAMA2', label: '/dev/ttyAMA2', pnpId: '/dev/ttyAMA2' })
-    }
-    if (fs.existsSync('/dev/ttyAMA3') && isPi()) {
-      this.serialDevices.push({ value: '/dev/ttyAMA3', label: '/dev/ttyAMA3', pnpId: '/dev/ttyAMA3' })
-    }
-    if (fs.existsSync('/dev/ttyAMA4') && isPi()) {
-      this.serialDevices.push({ value: '/dev/ttyAMA4', label: '/dev/ttyAMA4', pnpId: '/dev/ttyAMA4' })
-    }
-    // rpi uart has different name under Ubuntu
-    const data = await si.osInfo()
-    if (data.distro.toString().includes('Ubuntu') && fs.existsSync('/dev/ttyS0') && isPi()) {
-      // console.log("Running Ubuntu")
-      this.serialDevices.push({ value: '/dev/ttyS0', label: '/dev/ttyS0', pnpId: '/dev/ttyS0' })
-    }
-    // jetson serial ports
-    if (fs.existsSync('/dev/ttyTHS1')) {
-      this.serialDevices.push({ value: '/dev/ttyTHS1', label: '/dev/ttyTHS1', pnpId: '/dev/ttyTHS1' })
-    }
-    if (fs.existsSync('/dev/ttyTHS2')) {
-      this.serialDevices.push({ value: '/dev/ttyTHS2', label: '/dev/ttyTHS2', pnpId: '/dev/ttyTHS2' })
-    }
-    if (fs.existsSync('/dev/ttyTHS3')) {
-      this.serialDevices.push({ value: '/dev/ttyTHS3', label: '/dev/ttyTHS3', pnpId: '/dev/ttyTHS3' })
-    }
+    // Check for configuration issues
+    retError = this.checkSerialPortIssues()
 
     // set the active device as selected
     if (this.active && this.activeDevice && this.activeDevice.inputType === 'UART') {
       return callback(retError, this.serialDevices, this.baudRates, this.activeDevice.serial,
         this.activeDevice.baud, this.mavlinkVersions, this.activeDevice.mavversion,
-        this.active, this.enableHeartbeat, this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.tlogging, this.activeDevice.udpInputPort,
-        this.inputTypes[0], this.inputTypes)
+        this.active, this.enableHeartbeat, this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.doLogging, this.activeDevice.udpInputPort,
+        this.inputTypes[0].value, this.inputTypes)
     } else if (this.active && this.activeDevice && this.activeDevice.inputType === 'UDP') {
-      return callback(retError, this.serialDevices, this.baudRates, this.serialDevices.length > 0 ? this.serialDevices[0] : [], this.baudRates[3],
+      return callback(retError, this.serialDevices, this.baudRates, this.serialDevices.length > 0 ? this.serialDevices[0].value : [], this.baudRates[3].value,
         this.mavlinkVersions, this.activeDevice.mavversion, this.active, this.enableHeartbeat,
-        this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.tlogging, this.activeDevice.udpInputPort,
-        this.inputTypes[1], this.inputTypes)
+        this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.doLogging, this.activeDevice.udpInputPort,
+        this.inputTypes[1].value, this.inputTypes)
     } else {
       // no connection
-      return callback(retError, this.serialDevices, this.baudRates, this.serialDevices.length > 0 ? this.serialDevices[0] : [],
-        this.baudRates[3], this.mavlinkVersions, this.mavlinkVersions[1], this.active, this.enableHeartbeat,
-        this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.tlogging, 9000, this.inputTypes[0], this.inputTypes)
+      return callback(retError, this.serialDevices, this.baudRates, this.serialDevices.length > 0 ? this.serialDevices[0].value : [],
+        this.baudRates[3].value, this.mavlinkVersions, this.mavlinkVersions[1].value, this.active, this.enableHeartbeat,
+        this.enableTCP, this.enableUDPB, this.UDPBPort, this.enableDSRequest, this.doLogging, 9000, this.inputTypes[0].value, this.inputTypes)
     }
   }
 
@@ -552,7 +539,7 @@ class FCDetails {
   }
 
   startStopTelemetry (device, baud, mavversion, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest,
-                      tlogging, inputType, udpInputPort, callback) {
+                      doLogging, inputType, udpInputPort, callback) {
     // user wants to start or stop telemetry
     // callback is (err, isSuccessful)
 
@@ -561,7 +548,7 @@ class FCDetails {
     this.enableUDPB = enableUDPB
     this.UDPBPort = UDPBPort
     this.enableDSRequest = enableDSRequest
-    this.tlogging = tlogging
+    this.doLogging = doLogging
 
     if (this.m) {
       this.m.enableDSRequest = enableDSRequest
@@ -570,39 +557,36 @@ class FCDetails {
     // check port, mavversion and baud are valid (if starting telem)
     if (!this.active) {
       this.activeDevice = { serial: null, baud: null, inputType: 'UART', mavversion: null, udpInputPort: 9000 }
-      for (let i = 0, len = this.mavlinkVersions.length; i < len; i++) {
-        if (this.mavlinkVersions[i].value === mavversion.value) {
-          this.activeDevice.mavversion = this.mavlinkVersions[i]
-          break
-        }
-      }
+      this.activeDevice.mavversion = mavversion
 
-      if (inputType.value === 'UART') {
+      if (inputType === 'UART') {
         this.activeDevice.inputType = 'UART'
         for (let i = 0, len = this.serialDevices.length; i < len; i++) {
-          if (this.serialDevices[i].pnpId === device.pnpId) {
-            this.activeDevice.serial = this.serialDevices[i]
+          if (this.serialDevices[i].value === device) {
+            this.activeDevice.serial = this.serialDevices[i].value
             break
           }
         }
         for (let i = 0, len = this.baudRates.length; i < len; i++) {
-          if (this.baudRates[i].value === baud.value) {
-            this.activeDevice.baud = this.baudRates[i]
+          if (this.baudRates[i].value === baud) {
+            this.activeDevice.baud = this.baudRates[i].value
             break
           }
         }
+        console.log('Selected device: ' + device + ' @ ' + baud)
+        console.log(this.activeDevice)
 
-        if (this.activeDevice.serial === null || this.activeDevice.baud.value === null || this.activeDevice.serial.value === null || this.activeDevice.mavversion.value === null || this.enableTCP === null) {
+        if (this.activeDevice.serial === null || this.activeDevice.baud === null || this.activeDevice.serial.value === null || this.activeDevice.mavversion === null || this.enableTCP === null) {
           this.activeDevice = null
           this.active = false
           return callback(new Error('Bad serial device or baud'), false)
         }
-      } else if (inputType.value === 'UDP') {
+      } else if (inputType === 'UDP') {
         // UDP input
         this.activeDevice.inputType = 'UDP'
         this.activeDevice.serial = null
         this.activeDevice.baud = null
-        this.activeDevice.mavversion = { value: mavversion.value, label: mavversion.label }
+        this.activeDevice.mavversion = mavversion
         this.activeDevice.udpInputPort = udpInputPort
       } else {
         // unknown input type
@@ -646,7 +630,7 @@ class FCDetails {
       this.settings.setValue('flightcontroller.enableUDPB', this.enableUDPB)
       this.settings.setValue('flightcontroller.UDPBPort', this.UDPBPort)
       this.settings.setValue('flightcontroller.enableDSRequest', this.enableDSRequest)
-      this.settings.setValue('flightcontroller.tlogging', this.tlogging)
+      this.settings.setValue('flightcontroller.doLogging', this.doLogging)
       this.settings.setValue('flightcontroller.active', this.active)
       console.log('Saved FC settings')
     } catch (e) {

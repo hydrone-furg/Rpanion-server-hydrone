@@ -19,11 +19,16 @@ This is a node.js based server for companion computers used in Mavlink-based veh
 It presents a web-based interface (running on the companion computer), where system settings such as network,
 telemetry and video streaming can be configured from.
 
-On the Raspberry Pi, Rpanion-server is compatible with the Raspberry Pi OS and Ubuntu 20.04 LTS.
+Other functions such as log file management, NTRIP input and PPP connections are also supported.
 
-On the Nvidia Jetson, Rpanion-server is compatible with Ubuntu 18.04 LTS.
+## Supported Boards
 
-On the Nvidia Jetson Orin, Rpanion-server is compatible with Ubuntu 22.04 LTS.
+| Board | Compatible OS |
+|-------|--------------|
+| Raspberry Pi 3B or later| Raspberry Pi OS, Ubuntu 22.04 LTS |
+| Nvidia Jetson Orin | Ubuntu 22.04 LTS |
+| Orange Pi Zero 3 | Ubuntu 24.04 LTS |
+| Libre Computer Le Potato | Raspberry Pi OS |
 
 On the [Libre Computer Le Potato](https://libre.computer/products/aml-s905x-cc/), Rpanion-server is compatible with their flavor of [Raspberry Pi OS](https://distro.libre.computer/ci/raspbian/).
 
@@ -49,26 +54,24 @@ Rpanion-server allows the user to configure:
 ## Installing
 
 Rpanion-server has pre-built debian packges for arm64 platforms (Jetson, Raspberry Pi, etc). This
-is the easiest way to get started.
+is the easiest way to get started. The packages are available from the "Releases" page.
 
-There are also full disk images with a pre-configured Wifi hotspot for the Raspberry Pi.
+### Disk Images
 
-### Prerequisites
+There are full disk images with a pre-configured Wifi hotspot for the Raspberry Pi. These
+are on the "releases" page
 
-To (optionally) use the Zerotier and/or Wireguard VPN's, install as follows:
+### Installation from deb package
 
-```
-curl -s https://install.zerotier.com | sudo bash
-sudo apt install wireguard wireguard-tools
-```
+This method installs rpanion-server (and pre-requisities) on an existing system.
 
-Then install the required packages:
+First install the required packages:
 
 ```
-sudo apt install -y gstreamer1.0-plugins-good libgstrtspserver-1.0-dev gstreamer1.0-plugins-base-apps
-sudo apt install -y gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad python3-netifaces
-sudo apt install -y network-manager python3 python3-dev python3-gst-1.0 python3-pip dnsmasq git ninja-build jq
-sudo apt install -y libxml2-dev libxslt1-dev python3-lxml python3-numpy python3-future gpsbabel zip
+sudo apt install -y gstreamer1.0-plugins-good libgstrtspserver-1.0-0 gir1.2-gst-rtsp-server-1.0 
+sudo apt install -y gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-ugly gstreamer1.0-plugins-bad
+sudo apt install -y network-manager python3 python3-gst-1.0 python3-pip dnsmasq git jq wireless-tools iw
+sudo apt install -y python3-lxml python3-numpy gpsbabel zip python3-dev gstreamer1.0-x ppp python3-venv
 ```
 
 If running on RasPiOS, install the libcamera drivers:
@@ -77,21 +80,32 @@ If running on RasPiOS, install the libcamera drivers:
 sudo apt install -y gstreamer1.0-libcamera python3-picamera2 python3-libcamera python3-kms++
 ```
 
-Install Nodejs:
+If running on a NVIDIA Jetson Orin, install the hardware accelerated gstreamer packages:
 ```
-sudo apt install -y ca-certificates curl gnupg
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
-
-sudo apt update
-sudo apt install -y nodejs
+sudo apt install -y nvidia-l4t-gstreamer
 ```
 
-Then install Rpanion-server:
+Install Nodejs (from https://deb.nodesource.com/):
 ```
-sudo dpkg -i rpanion-server-xxx.deb
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo bash -
+sudo apt-get install -y nodejs
 ```
+
+
+To (optionally) use the Zerotier and/or Wireguard VPN's, install as follows:
+
+```
+curl -s https://install.zerotier.com | sudo bash
+sudo apt install wireguard wireguard-tools
+```
+
+Download Rpanion-server from the releases page, then install Rpanion-server:
+```
+wget https://github.com/stephendade/Rpanion-server/releases/download/v0.12.0/rpanion-server_0.12.0_arm64.deb
+sudo dpkg -i rpanion-server_0.12.0_arm64.deb
+```
+
+For device-specific configurations, see the ``./deploy`` folder for Jetson, X86 and Raspberry Pi (RasPiOS and Ubuntu) scripts.
 
 After installation, Rpanion-server will be available at http://<device_ip>:3001
 
@@ -106,7 +120,7 @@ Note the GPIO UARTs are not currently working with Ubuntu 24.04.
 If an older version of the Raspberry Pi OS is used (Buster, V10 or below), the ``gst-rpicamsrc`` Gstreamer element
 must be installed. See https://github.com/thaytan/gst-rpicamsrc for install instructions.
 
-### Automatic (Libre Computer AML-S905X-CC aka 'Le Potato') notes
+### Libre Computer AML-S905X-CC aka 'Le Potato' notes
 
 If using a usb to serial converter, you might need to modify permissions of the device.
 
@@ -123,10 +137,10 @@ https://www.xmodulo.com/change-usb-device-permission-linux.html
 
 ## Building and Running in development mode
 
-The mavlink-router (https://github.com/mavlink/mavlink-router) software is used for backend routing and is required to be installed.
-
 Follow the scripts in the ``/deploy`` folder for your selected platform to set up the
 development environment.
+
+Then run the ``devExtras.sh`` file to download a compiled ``mavlink-router`` binary.
 
 Running in development mode allows for any code changes to trigger a restart of Rpanion-server. 
 
@@ -143,6 +157,10 @@ It is important to *only* use ``npm run dev`` during development, as it will ski
 the user login and authentication checks.
 
 At this point, the website will be active at ``http://<ip of device>:3000``
+
+## Packaging
+
+To produce a deb package, run ``npm run package``.
 
 ## Default username and password
 

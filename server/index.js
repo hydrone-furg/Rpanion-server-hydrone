@@ -1,7 +1,6 @@
 const express = require('express')
 const fileUpload = require('express-fileupload')
 const compression = require('compression')
-const bodyParser = require('body-parser')
 const pino = require('pino-http')()
 const process = require('process')
 const jwt = require('jsonwebtoken');
@@ -50,7 +49,7 @@ let tokenBlacklist = [];
 app.use(limiter)
 
 // use file uploader for Wireguard profiles
-app.use(fileUpload({ limits: { fileSize: 500 }, abortOnLimit: true, useTempFiles: true, tempFileDir: '/tmp/', safeFileNames: true, preserveExtension: 4 }))
+app.use(fileUpload({ limits: { fileSize: 1000 }, abortOnLimit: true, useTempFiles: true, tempFileDir: '/tmp/', safeFileNames: true, preserveExtension: 4 }))
 
 // Init settings before running the other classes
 settings.init({
@@ -69,43 +68,101 @@ const adhocManager = new Adhoc(settings)
 const userMgmt = new userLogin()
 const pppConnectionManager = new pppConnection(settings)
 
-// Add graceful shutdown handlers
+// Graceful shutdown implementation
+let isShuttingDown = false
+const SHUTDOWN_TIMEOUT = 10000 // 10 seconds
+
+async function gracefulShutdown(signal, exitCode = 0) {
+  if (isShuttingDown) {
+    return
+  }
+  
+  isShuttingDown = true
+  console.log(`Received ${signal}. Shutting down gracefully...`)
+  
+  // Set a timeout to force shutdown if graceful shutdown takes too long
+  const forceShutdownTimer = setTimeout(() => {
+    console.error('Graceful shutdown timeout exceeded. Forcing shutdown...')
+    process.exit(1)
+  }, SHUTDOWN_TIMEOUT)
+  
+  try {
+    // Stop accepting new connections
+    if (http && http.listening) {
+      console.log('Closing HTTP server...')
+      console.log(`Waiting for ${activeConnections.size} active connections to finish...`)
+      
+      await new Promise((resolve, reject) => {
+        http.close((err) => {
+          if (err) {
+            console.error('Error closing HTTP server:', err)
+            reject(err)
+          } else {
+            resolve()
+          }
+        })
+      })
+    }
+    
+    // Stop Socket.IO connections
+    if (io) {
+      console.log('Closing Socket.IO connections...')
+      io.close()
+      console.log('Socket.IO closed')
+    }
+    
+    // Clear intervals
+    if (FCStatusLoop) {
+      clearInterval(FCStatusLoop)
+      FCStatusLoop = null
+      console.log('Status loop cleared')
+    }
+    
+    // Stop all managed services
+    console.log('Stopping managed services...')
+    pppConnectionManager.quitting()
+    cloud.quitting()
+    logConversion.quitting()
+    console.log('All services stopped')
+    
+    clearTimeout(forceShutdownTimer)
+    console.log('---Shutdown Rpanion Complete---')
+    process.exit(exitCode)
+  } catch (err) {
+    console.error('Error during graceful shutdown:', err)
+    clearTimeout(forceShutdownTimer)
+    process.exit(1)
+  }
+}
+
+// Handle SIGINT (Ctrl+C)
 process.on('SIGINT', () => {
-  console.log('Received SIGINT. Shutting down gracefully...')
-  pppConnectionManager.quitting()
-  cloud.quitting()
-  logConversion.quitting()
-  console.log('---Shutdown Rpanion---')
-  process.exit(0)
+  gracefulShutdown('SIGINT', 0)
 })
 
+// Handle SIGTERM (systemd stop)
 process.on('SIGTERM', () => {
-  console.log('Received SIGTERM. Shutting down gracefully...')
-  pppConnectionManager.quitting()
-  cloud.quitting()
-  logConversion.quitting()
-  console.log('---Shutdown Rpanion---')
-  process.exit(0)
+  gracefulShutdown('SIGTERM', 0)
 })
 
-// Also good to handle uncaught exceptions
+// Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err)
-  pppConnectionManager.quitting()
-  cloud.quitting()
-  logConversion.quitting()
-  console.log('---Shutdown Rpanion---')
-  process.exit(1)
+  gracefulShutdown('uncaughtException', 1)
 })
 
-// Handle nodemon restarts
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason)
+  gracefulShutdown('unhandledRejection', 1)
+})
+
+// Handle nodemon restarts (SIGUSR2)
 process.once('SIGUSR2', () => {
   console.log('Received SIGUSR2. Shutting down gracefully...')
-  pppConnectionManager.quitting()
-  cloud.quitting()
-  logConversion.quitting()
-  console.log('---Shutdown Rpanion---')
-  process.kill(process.pid, 'SIGUSR2')
+  gracefulShutdown('SIGUSR2', 0).then(() => {
+    process.kill(process.pid, 'SIGUSR2')
+  })
 })
 
 // Got an RTCM message, send to flight controller
@@ -180,12 +237,12 @@ fcManager.eventEmitter.on('disarmed', () => {
 
 let FCStatusLoop = null
 
-app.use(bodyParser.urlencoded({ extended: true }))
+app.use(express.urlencoded({ extended: true }))
 app.use(pino)
 
 // Simply pass `compression` as an Express middleware!
 app.use(compression())
-app.use(bodyParser.json())
+app.use(express.json())
 
 // Serve the static files from the React app
 app.use(express.static(path.join(__dirname, '..', '/build')))
@@ -313,29 +370,46 @@ app.post('/api/auth', authenticateToken, async (req, res) => {
 
 // Middleware to check if the request has a valid token
 function authenticateToken(req, res, next) {
-  let authHeader = null
-  let token = null
   // Skip authentication in development mode
   if (process.env.NODE_ENV === 'development') {
     return next();
   }
-  try {
-    authHeader = req.headers['authorization']
-    token = authHeader && authHeader.split(' ')[1]
-  } catch (err) {
-    return res.status(401).json({ message: 'Access denied. No token provided.' })
+
+  // Determine if this is a Socket.IO request
+  const isSocketIO = typeof res.status !== 'function'
+  
+  // Helper function to send error responses
+  const sendError = (statusCode, message) => {
+    if (isSocketIO) {
+      return next(new Error(message))
+    }
+    return res.status(statusCode).json({ message })
   }
 
-  if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' })
+  // Extract token
+  let token;
+  try {
+    const authHeader = req.headers['authorization']
+    token = authHeader && authHeader.split(' ')[1]
+  } catch (err) {
+    return sendError(401, 'Access denied. No token provided.')
+  }
+
+  if (!token) {
+    return sendError(401, 'Access denied. No token provided.')
+  }
 
   // Check if the token is blacklisted
   if (tokenBlacklist.includes(token)) {
-    return res.status(401).json({ message: 'Invalid token' })
+    return sendError(401, 'Invalid token')
   }
 
+  // Verify token
   jwt.verify(token, RPANION_SECRET_KEY, (err, user) => {
-    if (err) return res.status(403).json({ message: 'Invalid token' })
-    req.user = user // Attach user to request
+    if (err) {
+      return sendError(403, 'Invalid token')
+    }
+    req.user = user
     next()
   })
 }
@@ -354,8 +428,8 @@ app.get('/api/pppconfig', authenticateToken, (req, res) => {
 })
 
 app.post('/api/pppmodify', authenticateToken, [
-  check('device').isJSON(),
-  check('baudrate').isJSON(), 
+  check('device').not().isEmpty(),
+  check('baudrate').isInt(), 
   check('localIP').isIP(),
   check('remoteIP').isIP(),
   check('enabled').isBoolean()
@@ -369,7 +443,7 @@ app.post('/api/pppmodify', authenticateToken, [
   if (req.body.enabled === true) {
     console.log('Starting PPP connection');
     res.setHeader('Content-Type', 'application/json')
-    pppConnectionManager.startPPP(JSON.parse(req.body.device), JSON.parse(req.body.baudrate), req.body.localIP, req.body.remoteIP, (err, settings) => {
+    pppConnectionManager.startPPP(req.body.device, req.body.baudrate, req.body.localIP, req.body.remoteIP, (err, settings) => {
       if (err !== null) {
         console.log('Error in /api/pppmodify', { message: err })
         console.log(JSON.stringify({settings, error: err }))
@@ -692,8 +766,9 @@ app.get('/api/softwareinfo', authenticateToken, (req, res) => {
 })
 
 app.get('/api/videodevices', authenticateToken, (req, res) => {
-  vManager.populateAddresses()
-  vManager.getVideoDevices((err, devices, active, seldevice, selRes, selRot, selbitrate, selfps, SeluseUDP, SeluseUDPIP, SeluseUDPPort, timestamp, fps, FPSMax, vidres, useCameraHeartbeat, selMavURI) => {
+  vManager.getVideoDevices((err, devices, active, seldevice, selRes, selRot, selbitrate,
+                            selfps, SeluseUDPIP, SeluseUDPPort, timestamp,
+                            fps, FPSMax, vidres, useCameraHeartbeat, selMavURI, compression, Seltransport, transportOptions, customRTSPSource) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       res.send(JSON.stringify({
@@ -707,7 +782,8 @@ app.get('/api/videodevices', authenticateToken, (req, res) => {
         rotSelected: selRot,
         bitrate: selbitrate,
         fpsSelected: selfps,
-        UDPChecked: SeluseUDP,
+        transportSelected: Seltransport,
+        transportOptions: transportOptions,
         useUDPIP: SeluseUDPIP,
         useUDPPort: SeluseUDPPort,
         timestamp,
@@ -715,7 +791,9 @@ app.get('/api/videodevices', authenticateToken, (req, res) => {
         fps: fps,
         FPSMax: FPSMax,
         enableCameraHeartbeat: useCameraHeartbeat,
-        mavStreamSelected: selMavURI
+        mavStreamSelected: selMavURI,
+        compression: compression,
+        customRTSPSource: customRTSPSource
       }))
     } else {
       res.setHeader('Content-Type', 'application/json')
@@ -759,7 +837,7 @@ app.get('/api/FCOutputs', authenticateToken, (req, res) => {
 app.get('/api/FCDetails', authenticateToken, (req, res) => {
   res.setHeader('Content-Type', 'application/json')
   fcManager.getDeviceSettings((err, devices, bauds, seldevice, selbaud, mavers, selmav,
-    active, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest, tlogging,
+    active, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest, doLogging,
     udpInputPort, selInputType, inputTypes) => {
     // hacky way to pass through the
     if (!err) {
@@ -778,7 +856,7 @@ app.get('/api/FCDetails', authenticateToken, (req, res) => {
         enableUDPB,
         UDPBPort,
         enableDSRequest,
-        tlogging,
+        doLogging,
         udpInputPort,
         selInputType,
         inputTypes
@@ -799,7 +877,7 @@ app.get('/api/FCDetails', authenticateToken, (req, res) => {
         enableUDPB,
         UDPBPort,
         enableDSRequest,
-        tlogging,
+        doLogging,
         udpInputPort,
         selInputType,
         inputTypes
@@ -814,7 +892,31 @@ app.post('/api/shutdowncc', authenticateToken, function () {
   aboutPage.shutdownCC()
 })
 
-app.post('/api/FCModify', authenticateToken, [check('device').isJSON(), check('baud').isJSON(), check('mavversion').isJSON(), check('enableHeartbeat').isBoolean(), check('enableTCP').isBoolean(), check('enableUDPB').isBoolean(), check('UDPBPort').isPort(), check('enableDSRequest').isBoolean(), check('tlogging').isBoolean()], function (req, res) {
+app.post('/api/resetsettings', authenticateToken, function (req, res) {
+  // User wants to reset all settings to defaults
+  try {
+    const fs = require('fs')
+    const settingsPath = logpaths.settingsFile
+    
+    // Delete the settings file
+    if (fs.existsSync(settingsPath)) {
+      fs.unlinkSync(settingsPath)
+      console.log('Settings file deleted:', settingsPath)
+    }
+    
+    // Create empty settings object
+    fs.writeFileSync(settingsPath, '{}')
+    console.log('Settings reset to defaults')
+    
+    res.setHeader('Content-Type', 'application/json')
+    res.send(JSON.stringify({ success: true, message: 'Settings have been reset. Please restart the application for changes to take effect.' }))
+  } catch (error) {
+    console.error('Error resetting settings:', error)
+    res.status(500).send(JSON.stringify({ error: 'Failed to reset settings: ' + error.message }))
+  }
+})
+
+app.post('/api/FCModify', authenticateToken, [check('device'), check('baud').isInt(), check('mavversion').isInt(), check('enableHeartbeat').isBoolean(), check('enableTCP').isBoolean(), check('enableUDPB').isBoolean(), check('UDPBPort').isPort(), check('enableDSRequest').isBoolean(), check('doLogging').isBoolean()], function (req, res) {
   // User wants to start/stop FC telemetry
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
@@ -822,9 +924,9 @@ app.post('/api/FCModify', authenticateToken, [check('device').isJSON(), check('b
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
-  fcManager.startStopTelemetry(JSON.parse(req.body.device), JSON.parse(req.body.baud), JSON.parse(req.body.mavversion), req.body.enableHeartbeat,
+  fcManager.startStopTelemetry(req.body.device, req.body.baud, req.body.mavversion, req.body.enableHeartbeat,
                                req.body.enableTCP, req.body.enableUDPB, req.body.UDPBPort, req.body.enableDSRequest,
-                               req.body.tlogging, JSON.parse(req.body.inputType), req.body.udpInputPort, (err, isSuccess) => {
+                               req.body.doLogging, req.body.inputType, req.body.udpInputPort, (err, isSuccess) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       // console.log(isSuccess);
@@ -888,6 +990,7 @@ io.on('connection', function () {
     io.sockets.emit('CloudBinStatus', cloud.conStatusBinStr())
     io.sockets.emit('LogConversionStatus', logConversion.conStatusLogStr())
     io.sockets.emit('PPPStatus', pppConnectionManager.conStatusStr())
+    io.sockets.emit('VideoStreamStatus', vManager.getStreamingStatus())
   }, 1000)
 })
 
@@ -976,16 +1079,22 @@ app.post('/api/startstopvideo', authenticateToken, [check('active').isBoolean(),
   check('device').if(check('active').isIn([true])).isLength({ min: 2 }),
   check('height').if(check('active').isIn([true])).isInt({ min: 1 }),
   check('width').if(check('active').isIn([true])).isInt({ min: 1 }),
-  check('useUDP').if(check('active').isIn([true])).isBoolean(),
+  check('transport').if(check('active').isIn([true])).isIn(['RTP', 'RTSP']),
   check('useTimestamp').if(check('active').isIn([true])).isBoolean(),
   check('useCameraHeartbeat').if(check('active').isIn([true])).isBoolean(),
   check('useUDPPort').if(check('active').isIn([true])).isPort(),
   check('useUDPIP').if(check('active').isIn([true])).isIP(),
   check('bitrate').if(check('active').isIn([true])).isInt({ min: 50, max: 50000 }),
-  check('format').if(check('active').isIn([true])).isIn(['video/x-raw', 'video/x-h264', 'image/jpeg']),
+  check('format').if(check('active').isIn([true])).isIn(['video/x-raw', 'video/x-h264', 'video/x-h265', 'image/jpeg']),
   check('fps').if(check('active').isIn([true])).isInt({ min: -1, max: 100 }),
   check('rotation').if(check('active').isIn([true])).isInt().isIn([0, 90, 180, 270])],
-  check('compression').if(check('active').isIn([true])).isIn(['H264', 'H265']), (req, res) => {
+  check('compression').if(check('active').isIn([true])).isIn(['H264', 'H265']),
+  check('customRTSPSource').if(check('active').isIn([true])).custom((value) => {
+    if (value === '' || value === null || value === undefined) {
+      return true;
+    }
+    return check('customRTSPSource').isURL().run({ body: { customRTSPSource: value } });
+  }), (req, res) => {
   const errors = validationResult(req)
   if (!errors.isEmpty()) {
     console.log('Bad POST vars in /api/startstopvideo ', { message: errors.array() })
@@ -994,8 +1103,9 @@ app.post('/api/startstopvideo', authenticateToken, [check('active').isBoolean(),
   }
   // user wants to start/stop video streaming
   vManager.startStopStreaming(req.body.active, req.body.device, req.body.height, req.body.width, req.body.format, req.body.rotation,
-                              req.body.bitrate, req.body.fps, req.body.useUDP, req.body.useUDPIP, req.body.useUDPPort,
-                              req.body.useTimestamp, req.body.useCameraHeartbeat, req.body.mavStreamSelected, req.body.compression, (err, status, addresses) => {
+                              req.body.bitrate, req.body.fps, req.body.transport, req.body.useUDPIP, req.body.useUDPPort,
+                              req.body.useTimestamp, req.body.useCameraHeartbeat, req.body.mavStreamSelected, req.body.compression,
+                              req.body.customRTSPSource, (err, status, addresses) => {
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       const ret = { streamingStatus: status, streamAddresses: addresses }
@@ -1111,16 +1221,16 @@ app.post('/api/networkdelete', authenticateToken, [check('conName').isUUID()], (
 
 // user wants to edit network
 app.post('/api/networkedit', authenticateToken, [check('conName').isUUID(),
-  check('conSettings.ipaddresstype.value').isIn(['auto', 'manual', 'shared']),
-  check('conSettings.ipaddress.value').optional().isIP(),
-  check('conSettings.subnet.value').optional().isIP(),
-  check('conSettings.wpaType.value').optional().isIn(['none', 'wpa-psk']),
-  check('conSettings.password.value').optional().escape(),
-  check('conSettings.ssid.value').optional().escape(),
-  check('conSettings.attachedIface.value').optional().escape(),
-  check('conSettings.band.value').optional().isIn(['a', 'bg']),
-  check('conSettings.channel.value').optional().isInt(),
-  check('conSettings.mode.value').optional().isIn(['infrastructure', 'ap'])
+  check('conSettings.ipaddresstype').isIn(['auto', 'manual', 'shared']),
+  check('conSettings.ipaddress').optional().isIP(),
+  check('conSettings.subnet').optional().isIP(),
+  check('conSettings.wpaType').optional().isIn(['none', 'wpa-psk']),
+  check('conSettings.password').optional().escape(),
+  check('conSettings.ssid').optional().escape(),
+  check('conSettings.attachedIface').optional().escape(),
+  check('conSettings.band').optional().isIn(['a', 'bg']),
+  check('conSettings.channel').optional().isInt(),
+  check('conSettings.mode').optional().isIn(['infrastructure', 'ap'])
 ],
 (req, res) => {
   // Finds the validation errors in this request and wraps them in an object with handy functions
@@ -1148,16 +1258,16 @@ app.post('/api/networkedit', authenticateToken, [check('conName').isUUID(),
 })
 
 // User wants to add network
-app.post('/api/networkadd', authenticateToken, [check('conSettings.ipaddresstype.value').isIn(['auto', 'manual', 'shared']),
-  check('conSettings.ipaddress.value').optional().isIP(),
-  check('conSettings.subnet.value').optional().isIP(),
-  check('conSettings.wpaType.value').optional().isIn(['none', 'wpa-psk']),
-  check('conSettings.password.value').optional().escape(),
-  check('conSettings.ssid.value').optional().escape(),
-  check('conSettings.band.value').optional().isIn(['a', 'bg']),
-  check('conSettings.channel.value').optional().isInt(),
-  check('conSettings.attachedIface.value').optional().escape(),
-  check('conSettings.mode.value').optional().isIn(['infrastructure', 'ap']),
+app.post('/api/networkadd', authenticateToken, [check('conSettings.ipaddresstype').isIn(['auto', 'manual', 'shared']),
+  check('conSettings.ipaddress').optional().isIP(),
+  check('conSettings.subnet').optional().isIP(),
+  check('conSettings.wpaType').optional().isIn(['none', 'wpa-psk']),
+  check('conSettings.password').optional().escape(),
+  check('conSettings.ssid').optional().escape(),
+  check('conSettings.band').optional().isIn(['a', 'bg']),
+  check('conSettings.channel').optional().isInt(),
+  check('conSettings.attachedIface').optional().escape(),
+  check('conSettings.mode').optional().isIn(['infrastructure', 'ap']),
   check('conName').escape(),
   check('conType').escape(),
   check('conAdapter').escape()
@@ -1198,6 +1308,32 @@ if (process.env.NODE_ENV !== 'development')
   })
 }
 
+// Track active connections for graceful shutdown
+const activeConnections = new Set()
+
+// Add connection tracking middleware
+app.use((req, res, next) => {
+  // Return 503 if shutting down
+  if (isShuttingDown) {
+    res.set('Connection', 'close')
+    return res.status(503).json({ error: 'Server is shutting down' })
+  }
+  
+  // Track this connection
+  activeConnections.add(res)
+  
+  // Remove when done
+  res.on('finish', () => {
+    activeConnections.delete(res)
+  })
+  
+  res.on('close', () => {
+    activeConnections.delete(res)
+  })
+  
+  next()
+})
+
 module.exports = app;
 
 // Only start the server if this file is being run directly (not imported)
@@ -1205,6 +1341,8 @@ if (require.main === module) {
   const port = process.env.PORT || 3001;
   http.listen(port, () => {
     console.log(`Server running on port ${port}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'production'}`);
+    console.log('Press Ctrl+C to stop');
   });
 }
 
