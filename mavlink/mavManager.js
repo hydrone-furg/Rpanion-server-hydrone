@@ -81,13 +81,16 @@ class mavManager {
       const clazz = REGISTRY[packet.header.msgid]
       if (!clazz) {
         // bad message - can't process here any further
-        // console.log("Generic: ", packet)
         this.eventEmitter.emit('gotMessage', packet, null)
         return
       }
       const data = packet.protocol.data(packet.payload, clazz)
-      // console.log(packet)
 
+      ////// /
+      if (packet.header && packet.header.sysid) {
+        this.eventEmitter.emit('radarPing', packet.header.sysid);
+      }
+      ////// //
       // set the target system/comp ID if needed
       // ensure it's NOT a GCS, as mavlink-router will sometimes route
       // messages from connected GCS's

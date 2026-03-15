@@ -859,6 +859,9 @@ app.get('/api/FCDetails', authenticateToken, (req, res) => {
         doLogging,
         udpInputPort,
         selInputType,
+        ////// /
+        dronesConfig: fcManager.dronesConfig,
+        ////// //
         inputTypes
       }))
     } else {
@@ -880,6 +883,9 @@ app.get('/api/FCDetails', authenticateToken, (req, res) => {
         doLogging,
         udpInputPort,
         selInputType,
+        ////// /
+        dronesConfig: fcManager.dronesConfig,
+        ////// //
         inputTypes
       }))
       console.log('Error in /api/FCDetails ', { message: err })
@@ -924,9 +930,10 @@ app.post('/api/FCModify', authenticateToken, [check('device'), check('baud').isI
     return res.status(422).json({ error: JSON.stringify(errors.array()) })
   }
 
+  ////// /
   fcManager.startStopTelemetry(req.body.device, req.body.baud, req.body.mavversion, req.body.enableHeartbeat,
                                req.body.enableTCP, req.body.enableUDPB, req.body.UDPBPort, req.body.enableDSRequest,
-                               req.body.doLogging, req.body.inputType, req.body.udpInputPort, (err, isSuccess) => {
+                               req.body.doLogging, req.body.inputType, req.body.udpInputPort, req.body.dronesConfig, (err, isSuccess) => { ////// //
     if (!err) {
       res.setHeader('Content-Type', 'application/json')
       // console.log(isSuccess);

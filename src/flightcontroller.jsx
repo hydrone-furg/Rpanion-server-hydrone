@@ -28,6 +28,13 @@ class FCPage extends basePage {
       enableTCP: null,
       FCStatus: {},
       UDPoutputs: [],
+      newDroneType: "UDP", ////// /
+      newDroneBaud: 57600,
+      dronesConfig: [],
+      newDroneName: "drone1",
+      newDroneSysId: 1,
+      newDroneInPort: 14551,
+      newDroneGcsPort: 14558, ////// //
       addrow: "",
       enableUDPB: false,
       UDPBPort: 14550,
@@ -95,6 +102,31 @@ class FCPage extends basePage {
     this.setState({ UDPBPort: parseInt(event.target.value) });
   }
 
+  handleDroneInputChange = (event) => { ////// /
+    this.setState({ [event.target.name]: event.target.value });
+  }
+
+  handleAddDrone = () => {
+    const newDrone = {
+      name: this.state.newDroneName,
+      type: this.state.newDroneType,
+      sysId: parseInt(this.state.newDroneSysId),
+      inPort: parseInt(this.state.newDroneInPort),
+      inPort: this.state.newDroneInPort,
+      baud: parseInt(this.state.newDroneBaud),
+      gcsPort: parseInt(this.state.newDroneGcsPort)
+    };
+    this.setState(prevState => ({
+      dronesConfig: [...prevState.dronesConfig, newDrone]
+    }));
+  }
+
+  handleRemoveDrone = (index) => {
+    const updatedDrones = [...this.state.dronesConfig];
+    updatedDrones.splice(index, 1);
+    this.setState({ dronesConfig: updatedDrones });
+  } ////// //
+
   handleSubmit = () => {
     //user clicked start/stop telemetry
     fetch('/api/FCModify', {
@@ -115,6 +147,7 @@ class FCPage extends basePage {
         enableUDPB: this.state.enableUDPB,
         UDPBPort: this.state.UDPBPort,
         enableDSRequest: this.state.enableDSRequest,
+        dronesConfig: this.state.dronesConfig, ///////// /
         doLogging: this.state.doLogging
       })
     }).then(response => response.json()).then(state => { this.setState(state) });
@@ -307,6 +340,115 @@ class FCPage extends basePage {
           </Accordion.Body>
         </Accordion.Item>
         <Accordion.Item eventKey="2">
+          {/*////// /*/}
+          <Accordion.Item eventKey="3">
+            <Accordion.Header>Multi-Vehicle Routing</Accordion.Header>
+            <Accordion.Body>
+              <p><i>Configuração de frota (UDP/Serial).</i></p>
+              
+              <Table striped bordered hover size="sm">
+                <thead>
+                  <tr>
+                    <th>Nome</th>
+                    <th>Tipo</th>
+                    <th>SysID</th>
+                    <th>Entrada (Drone)</th>
+                    <th>Saída (GCS)</th>
+                    <th>Ação</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {this.state.dronesConfig.map((drone, index) => (
+                    <tr key={index}>
+                      <td>{drone.name}</td>
+                      <td><span className="badge bg-info">{drone.type}</span></td>
+                      <td><strong>{drone.sysId}</strong></td>
+                      <td>{drone.inPort}{drone.type === 'UART' ? ` @ ${drone.baud}` : ''}</td>
+                      <td>{drone.gcsPort}</td>
+                      <td>
+                        <Button size="sm" variant="danger" disabled={this.state.telemetryStatus} onClick={() => this.handleRemoveDrone(index)}>Excluir</Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+
+              <hr />
+              <h5>Adicionar Novo Veículo</h5>
+              <div className="row g-1 align-items-end">
+                
+                <div className="col-md-1">
+                  <label className="small fw-bold">Tipo</label>
+                  <Form.Select size="sm" name="newDroneType" value={this.state.newDroneType} onChange={this.handleDroneInputChange}>
+                    <option value="UDP">UDP</option>
+                    <option value="UART">UART</option>
+                  </Form.Select>
+                </div>
+
+                <div className="col-md-2">
+                  <label className="small fw-bold">Nome</label>
+                  <input type="text" className="form-control form-control-sm" name="newDroneName" value={this.state.newDroneName} onChange={this.handleDroneInputChange} placeholder="Drone 1"/>
+                </div>
+
+                <div className="col-md-1">
+                  <label className="small fw-bold text-nowrap">SysID</label>
+                  <input type="number" className="form-control form-control-sm" name="newDroneSysId" value={this.state.newDroneSysId} onChange={this.handleDroneInputChange} />
+                </div>
+
+                <div className="col-md-2">
+                  <label className="small fw-bold">
+                    {this.state.newDroneType === 'UART' ? 'Dispositivo Serial' : 'Porta UDP'}
+                  </label>
+                  
+                  {this.state.newDroneType === 'UART' ? (
+                    <Form.Select 
+                      size="sm" 
+                      name="newDroneInPort" 
+                      value={this.state.newDroneInPort} 
+                      onChange={this.handleDroneInputChange}
+                    >
+                      <option value="">Selecione...</option>
+                      {this.state.serialPorts.map((port) => (
+                        <option key={port.value} value={port.value}>{port.label}</option>
+                      ))}
+                    </Form.Select>
+                  ) : (
+                    <input 
+                      type="number" 
+                      className="form-control form-control-sm" 
+                      name="newDroneInPort" 
+                      value={this.state.newDroneInPort} 
+                      onChange={this.handleDroneInputChange} 
+                      placeholder="14550"
+                    />
+                  )}
+                </div>
+
+                {this.state.newDroneType === 'UART' && (
+                  <div className="col-md-2">
+                    <label className="small fw-bold">Baud</label>
+                    <Form.Select size="sm" name="newDroneBaud" value={this.state.newDroneBaud} onChange={this.handleDroneInputChange}>
+                      {this.state.baudRates.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </Form.Select>
+                  </div>
+                )}
+
+                <div className="col-md-2">
+                  <label className="small fw-bold text-nowrap">Saída GCS</label>
+                  <input type="number" className="form-control form-control-sm" name="newDroneGcsPort" value={this.state.newDroneGcsPort} onChange={this.handleDroneInputChange} />
+                </div>
+
+                <div className="col-md-2">
+                  <Button size="sm" variant="primary" className="w-100" onClick={this.handleAddDrone} disabled={this.state.telemetryStatus}>
+                    Adicionar
+                  </Button>
+                </div>
+              </div>
+            </Accordion.Body>
+          </Accordion.Item>
+          {/*////// //*/}
           <Accordion.Header>Other Options</Accordion.Header>
           <Accordion.Body>
             <p><i>Allow Rpanion-server to send datastream requests. Required if a GCS is not connected</i></p>

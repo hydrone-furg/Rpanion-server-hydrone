@@ -6,12 +6,51 @@ const { spawn, spawnSync } = require('child_process')
 const mavManager = require('../mavlink/mavManager.js')
 const logpaths = require('./paths.js')
 const { detectSerialDevices, isModemManagerInstalled, isPi, getSerialPathFromValue } = require('./serialDetection.js')
+////// /
+function generateRouterConf(config) {
+  let confText = "[General]\nReportStats=false\n\n";
+  const allSysIds = config.map(d => d.sysId);
+
+  config.forEach(drone => {
+    if (drone.type === 'UART') {
+      confText += `[UartEndpoint ${drone.name}]\n`;
+      confText += `Device = ${drone.inPort}\n`;
+      confText += `Baud = ${drone.baud || 57600}\n`;
+    } 
+    
+    else {
+      confText += `[UdpEndpoint ${drone.name}]\n`;
+      confText += `Mode = server\n`;
+      confText += `Address = 0.0.0.0\n`;
+      confText += `Port = ${drone.inPort}\n`;
+    }
+    
+    confText += `AllowSrcSysIn = ${drone.sysId}\n`;
+    allSysIds.forEach(id => { if (id !== drone.sysId) confText += `BlockSrcSysIn = ${id}\n`; });
+    confText += `\n`;
+
+    confText += `[UdpEndpoint gcs_${drone.name}]\n`;
+    confText += `Mode = normal\n`;
+    confText += `Address = 127.0.0.1\n`;
+    confText += `Port = ${drone.gcsPort}\n`;
+    confText += `AllowSrcSysOut = ${drone.sysId}\n`;
+    allSysIds.forEach(id => { if (id !== drone.sysId) confText += `BlockSrcSysOut = ${id}\n`; });
+    confText += `\n`;
+  });
+
+  const confPath = path.join('/tmp', 'dynamic_router.conf');
+  fs.writeFileSync(confPath, confText);
+  return confPath;
+}
+////// //
 
 class FCDetails {
   constructor (settings) {
     // if the device was successfully opend and got packets
     this.previousConnection = false
-
+    ////// /
+    this.activeVehicles = {};
+    ////// //
     // all detected serial ports and baud rates
     this.serialDevices = []
     this.baudRates = [{ value: 9600, label: '9600' },
@@ -88,7 +127,9 @@ class FCDetails {
     this.enableDSRequest = this.settings.value('flightcontroller.enableDSRequest', false)
     this.doLogging = this.settings.value('flightcontroller.doLogging', false)
     this.active = this.settings.value('flightcontroller.active', false)
-
+    ////// /
+    this.dronesConfig = this.settings.value('flightcontroller.dronesConfig', []) || [];
+    ////// //
     if (this.active) {
       // restart link if saved serial device is found
       this.getDeviceSettings((err, devices) => {
@@ -238,9 +279,35 @@ class FCDetails {
 
     return this.getUDPOutputs()
   }
-
+  ////// /
   getSystemStatus () {
-    // get the system status
+    if (this.dronesConfig && this.dronesConfig.length > 0) {
+      const now = Date.now();
+      
+      for (const id in this.activeVehicles) {
+        if (now - this.activeVehicles[id] > 5000) {
+          delete this.activeVehicles[id];
+        }
+      }
+
+      const frotaAtiva = this.dronesConfig.map(drone => {
+        const isOnline = this.activeVehicles[drone.sysId] ? '🟢' : '🔴';
+        return `${drone.name} [ID:${drone.sysId}] ${isOnline}`;
+      }).join(' | ');
+
+      const qtdOnline = Object.keys(this.activeVehicles).length;
+
+      return {
+        numpackets: this.m !== null ? this.m.statusNumRxPackets : 0, 
+        FW: 'Mavlink Router',
+        vehType: frotaAtiva || 'Aguardando conexões...',
+        conStatus: qtdOnline > 0 ? 'Routing Active' : 'Not connected',
+        statusText: `Gerenciando ${this.dronesConfig.length} veículos configurados.`,
+        byteRate: this.m !== null ? this.m.statusBytesPerSec.avgBytesSec : 0,
+        fcVersion: `${qtdOnline} / ${this.dronesConfig.length} Conectados`
+      }
+    }
+
     if (this.m !== null) {
       return {
         numpackets: this.m.statusNumRxPackets,
@@ -251,19 +318,13 @@ class FCDetails {
         byteRate: this.m.statusBytesPerSec.avgBytesSec,
         fcVersion: this.m.fcVersion
       }
-    } else {
-      return {
-        numpackets: 0,
-        FW: '',
-        vehType: '',
-        conStatus: 'Not connected',
-        statusText: '',
-        byteRate: 0,
-        fcVersion: ''
-      }
+    } 
+
+    else {
+      return { numpackets: 0, FW: '', vehType: '', conStatus: 'Not connected', statusText: '', byteRate: 0, fcVersion: '' }
     }
   }
-
+  ////// //
   rebootFC () {
     // command the flight controller to reboot
     if (this.m !== null) {
@@ -364,19 +425,38 @@ class FCDetails {
     //if (this.doLogging === true) {
     //  cmd.push('--telemetry-log')
     //}
+    ////// /
+    const dronesConfig = this.dronesConfig || []; 
+
     if (this.enableUDPB === true) {
-      cmd.push('0.0.0.0:' + this.UDPBPort)
+      cmd.push('0.0.0.0:' + this.UDPBPort);
     }
+
+    let dynamicConfPath = null;
+    if (dronesConfig.length > 0) {
+        dynamicConfPath = generateRouterConf(dronesConfig);
+    }
+
     if (this.activeDevice.inputType === 'UART') {
-      const serialPath = getSerialPathFromValue(this.activeDevice.serial, this.serialDevices)
-      cmd.push(serialPath + ':' + this.activeDevice.baud)
-      cmd.push('-c');
-      cmd.push('~/routerUART.conf'); //////
-    } else if (this.activeDevice.inputType === 'UDP') {
-      cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort)
-      cmd.push('-c');
-      cmd.push('~/router.conf'); ////
+      const serialPath = getSerialPathFromValue(this.activeDevice.serial, this.serialDevices);
+      cmd.push(serialPath + ':' + this.activeDevice.baud);
+      
+      if (dynamicConfPath) {
+        cmd.push('-c');
+        cmd.push(dynamicConfPath);
+      }
+
+    } 
+    
+    else if (this.activeDevice.inputType === 'UDP') {
+      cmd.push('0.0.0.0:' + this.activeDevice.udpInputPort);
+      
+      if (dynamicConfPath) {
+        cmd.push('-c');
+        cmd.push(dynamicConfPath);
+      }
     }
+    ////// //
     console.log(cmd)
 
     // check mavlink-router exists
@@ -423,15 +503,21 @@ class FCDetails {
 
     // only restart the mavlink processor if it's a new link,
     // not a reconnect attempt
+    ////// /
     if (this.m === null) {
       this.m = new mavManager(this.activeDevice.mavversion, '127.0.0.1', 14540, this.enableDSRequest)
+      
+      this.m.eventEmitter.on('radarPing', (sysId) => {
+        if (!this.activeVehicles) this.activeVehicles = {}; 
+        this.activeVehicles[sysId] = Date.now();
+      });
+
       this.m.eventEmitter.on('gotMessage', (packet, data) => {
-        // got valid message - send on to attached classes
-        this.previousConnection = true
+        this.previousConnection = true;
         this.eventEmitter.emit('gotMessage', packet, data)
       })
     }
-
+    ////// //
     // arming events - just pass them on
     this.m.eventEmitter.on('armed', () => {
       this.eventEmitter.emit('armed')
@@ -541,9 +627,9 @@ class FCDetails {
       }
     }, 1000)
   }
-
+  ////// /
   startStopTelemetry (device, baud, mavversion, enableHeartbeat, enableTCP, enableUDPB, UDPBPort, enableDSRequest,
-                      doLogging, inputType, udpInputPort, callback) {
+                      doLogging, inputType, udpInputPort, dronesConfig, callback) { ////// //
     // user wants to start or stop telemetry
     // callback is (err, isSuccessful)
 
@@ -553,7 +639,10 @@ class FCDetails {
     this.UDPBPort = UDPBPort
     this.enableDSRequest = enableDSRequest
     this.doLogging = doLogging
-
+    ////// /
+    this.dronesConfig = dronesConfig || [];
+    this.settings.setValue('flightcontroller.dronesConfig', this.dronesConfig); 
+    ////// //
     if (this.m) {
       this.m.enableDSRequest = enableDSRequest
     }
@@ -636,6 +725,9 @@ class FCDetails {
       this.settings.setValue('flightcontroller.enableDSRequest', this.enableDSRequest)
       this.settings.setValue('flightcontroller.doLogging', this.doLogging)
       this.settings.setValue('flightcontroller.active', this.active)
+      ////// /
+      this.settings.setValue('flightcontroller.dronesConfig', this.dronesConfig)
+      ////// //
       console.log('Saved FC settings')
     } catch (e) {
       console.log(e)
