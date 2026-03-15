@@ -84,7 +84,7 @@
     "group": "rpanion",
     "install_strategy": "copy",
     "maintainer": "Stephen Dade (stephen_dade@hotmail.com)",
-    "architecture": "${DEB_HOST_ARCH}",
+    "architecture": "amd64",
     "description": "A node.js based server for companion computers used in Mavlink-based vehicles (ie Ardupilot, PX4). It presents a web-based interface (running on the companion computer), where system settings such as network, telemetry and video streaming can be configured from.",
     "templates": {
       "systemd_service": "./debian/systemd.service",
