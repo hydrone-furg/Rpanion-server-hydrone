@@ -107,12 +107,12 @@ class FCPage extends basePage {
   }
 
   handleAddDrone = () => {
+    const newPort = this.state.newDroneType === 'UART' ? this.state.newDroneInPort : parseInt(this.state.newDroneInPort);
     const newDrone = {
       name: this.state.newDroneName,
       type: this.state.newDroneType,
       sysId: parseInt(this.state.newDroneSysId),
-      inPort: parseInt(this.state.newDroneInPort),
-      inPort: this.state.newDroneInPort,
+      inPort: newPort,
       baud: parseInt(this.state.newDroneBaud),
       gcsPort: parseInt(this.state.newDroneGcsPort)
     };
@@ -120,7 +120,7 @@ class FCPage extends basePage {
       dronesConfig: [...prevState.dronesConfig, newDrone]
     }));
   }
-
+  
   handleRemoveDrone = (index) => {
     const updatedDrones = [...this.state.dronesConfig];
     updatedDrones.splice(index, 1);

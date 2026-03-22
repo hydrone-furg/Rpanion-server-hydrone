@@ -7,14 +7,15 @@ const mavManager = require('../mavlink/mavManager.js')
 const logpaths = require('./paths.js')
 const { detectSerialDevices, isModemManagerInstalled, isPi, getSerialPathFromValue } = require('./serialDetection.js')
 ////// /
-function generateRouterConf(config) {
+function generateRouterConf(config, serialDevices) {
   let confText = "[General]\nReportStats=false\n\n";
   const allSysIds = config.map(d => d.sysId);
 
   config.forEach(drone => {
     if (drone.type === 'UART') {
+      const uartDevicePath = getSerialPathFromValue(drone.inPort, serialDevices) || drone.inPort;
       confText += `[UartEndpoint ${drone.name}]\n`;
-      confText += `Device = ${drone.inPort}\n`;
+      confText += `Device = ${uartDevicePath}\n`;
       confText += `Baud = ${drone.baud || 57600}\n`;
     } 
     
@@ -432,10 +433,10 @@ class FCDetails {
       cmd.push('0.0.0.0:' + this.UDPBPort);
     }
 
-    let dynamicConfPath = null;
+    let dynamicConfPath = null; ///////////// /
     if (dronesConfig.length > 0) {
-        dynamicConfPath = generateRouterConf(dronesConfig);
-    }
+        dynamicConfPath = generateRouterConf(dronesConfig, this.serialDevices);
+    } ///////////// //
 
     if (this.activeDevice.inputType === 'UART') {
       const serialPath = getSerialPathFromValue(this.activeDevice.serial, this.serialDevices);
